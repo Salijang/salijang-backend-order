@@ -12,7 +12,7 @@ import httpx
 from database import get_db
 from deps import get_current_user, CurrentUser
 from redis_client import reserve_stock, restore_stock
-from sqs_client import publish_order_event
+from sqs_client import publish_order_event, publish_stock_deduct_event
 import models
 import schemas
 
@@ -123,19 +123,6 @@ async def create_order(
         )
         db.add(item)
 
-    deducted = []
-    for item_data in order_data.items:
-        if item_data.product_id:
-            success, message = await adjust_product_remaining(item_data.product_id, -item_data.quantity)
-            if not success:
-                for restored_id, restored_qty in deducted:
-                    await adjust_product_remaining(restored_id, restored_qty)
-                for pid, qty in redis_reserved:
-                    await restore_stock(pid, qty)
-                await db.rollback()
-                raise HTTPException(status_code=409, detail=message)
-            deducted.append((item_data.product_id, item_data.quantity))
-
     await db.commit()
 
     result = await db.execute(
@@ -144,6 +131,16 @@ async def create_order(
         .filter(models.Order.id == new_order.id)
     )
     created_order = result.scalars().first()
+
+    await publish_stock_deduct_event({
+        "event_type": "stock_deduct",
+        "order_id": created_order.id,
+        "items": [
+            {"product_id": item.product_id, "quantity": item.quantity}
+            for item in created_order.items
+            if item.product_id
+        ],
+    })
     await send_notify_event("order_confirmed", created_order)
     return created_order
 
