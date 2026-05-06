@@ -1,4 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+import asyncio
+import json
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
@@ -11,8 +14,8 @@ import httpx
 
 from database import get_db
 from deps import get_current_user, CurrentUser
-from redis_client import reserve_stock, restore_stock
-from sqs_client import publish_order_event
+from redis_client import reserve_stock, restore_stock, get_redis
+from sqs_client import publish_order_event, publish_stock_deduct_event
 import models
 import schemas
 
@@ -72,13 +75,22 @@ def generate_order_number(order_id: int, created_at: datetime.datetime) -> str:
     return f"PK-{date_str}-{order_id:04d}"
 
 
+async def _publish_store_event(store_id: int | None, data: dict) -> None:
+    if not store_id:
+        return
+    try:
+        r = await get_redis()
+        await r.publish(f"sse:store:{store_id}", json.dumps(data, default=str))
+    except Exception as e:
+        print(f"[SSE] store publish 실패 (store_id={store_id}): {e}")
+
+
 @router.post("/", response_model=schemas.OrderResponse, status_code=status.HTTP_201_CREATED)
 async def create_order(
     order_data: schemas.OrderCreate,
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    # Redis로 재고를 원자적으로 선점. 장애 시 HTTP 폴백.
     redis_reserved: list[tuple[int, int]] = []
     for item_data in order_data.items:
         if not item_data.product_id:
@@ -90,7 +102,6 @@ async def create_order(
             raise HTTPException(status_code=409, detail="재고가 부족합니다.")
         if result is True:
             redis_reserved.append((item_data.product_id, item_data.quantity))
-        # result is None → Redis 장애: HTTP 폴백으로 처리
         if result is None:
             remaining = await get_product_remaining(item_data.product_id)
             if remaining is None:
@@ -123,19 +134,6 @@ async def create_order(
         )
         db.add(item)
 
-    deducted = []
-    for item_data in order_data.items:
-        if item_data.product_id:
-            success, message = await adjust_product_remaining(item_data.product_id, -item_data.quantity)
-            if not success:
-                for restored_id, restored_qty in deducted:
-                    await adjust_product_remaining(restored_id, restored_qty)
-                for pid, qty in redis_reserved:
-                    await restore_stock(pid, qty)
-                await db.rollback()
-                raise HTTPException(status_code=409, detail=message)
-            deducted.append((item_data.product_id, item_data.quantity))
-
     await db.commit()
 
     result = await db.execute(
@@ -144,7 +142,24 @@ async def create_order(
         .filter(models.Order.id == new_order.id)
     )
     created_order = result.scalars().first()
+
+    await publish_stock_deduct_event({
+        "event_type": "stock_deduct",
+        "order_id": created_order.id,
+        "items": [
+            {"product_id": item.product_id, "quantity": item.quantity}
+            for item in created_order.items
+            if item.product_id
+        ],
+    })
     await send_notify_event("order_confirmed", created_order)
+
+    order_payload = schemas.OrderResponse.model_validate(created_order).model_dump(mode="json")
+    await _publish_store_event(
+        created_order.store_id,
+        {"event_type": "new_order", "order": order_payload},
+    )
+
     return created_order
 
 
@@ -213,6 +228,40 @@ async def list_pending_orders_internal(db: AsyncSession = Depends(get_db)):
     return result.scalars().all()
 
 
+@router.get("/stream")
+async def stream_store_orders(
+    request: Request,
+    store_id: int,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    async def generator():
+        r = await get_redis()
+        pubsub = r.pubsub()
+        channel = f"sse:store:{store_id}"
+        await pubsub.subscribe(channel)
+        try:
+            while True:
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30.0)
+                if message:
+                    yield f"data: {message['data']}\n\n"
+                else:
+                    yield ": ping\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await pubsub.unsubscribe(channel)
+            await pubsub.aclose()
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.get("/{order_id}", response_model=schemas.OrderResponse)
 async def get_order(
     order_id: int,
@@ -257,12 +306,14 @@ async def update_order_status(
 
     if status_update.status == "completed":
         await send_notify_event("pickup_completed", order)
+        await _publish_store_event(order.store_id, {"event_type": "order_removed", "order_id": order_id})
     elif status_update.status == "cancelled":
         for item in order.items:
             if item.product_id:
                 await restore_stock(item.product_id, item.quantity)
                 await adjust_product_remaining(item.product_id, item.quantity)
         await send_notify_event("order_cancelled", order)
+        await _publish_store_event(order.store_id, {"event_type": "order_removed", "order_id": order_id})
 
     return order
 
@@ -283,6 +334,7 @@ async def cancel_order(
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
+    store_id = order.store_id
     items_snapshot = list(order.items)
     order.status = "cancelled"
     await db.commit()
@@ -294,4 +346,5 @@ async def cancel_order(
 
     event_type = "order_cancelled_by_buyer" if cancelled_by == "buyer" else "order_cancelled_by_seller"
     await send_notify_event(event_type, order)
+    await _publish_store_event(store_id, {"event_type": "order_removed", "order_id": order_id})
     return None
