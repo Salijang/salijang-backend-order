@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.future import select
 from database import engine, SessionLocal
 from routers import orders
@@ -48,6 +49,14 @@ app = FastAPI(
     description="Microservice for managing pickup reservations and orders.",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://sallijang.shop"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(orders.router)
