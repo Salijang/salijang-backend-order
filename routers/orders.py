@@ -44,7 +44,7 @@ async def send_notify_event(event_type: str, order: models.Order) -> None:
         "order_id": order.id,
         "order_number": order.order_number,
         "buyer_id": order.buyer_id,
-        "store_id": order.store_id or 0,
+        "store_id": order.store_id,
         "store_name": order.store_name,
         "product_names": [item.product_name for item in order.items],
         "pickup_expected_at": order.pickup_expected_at,
