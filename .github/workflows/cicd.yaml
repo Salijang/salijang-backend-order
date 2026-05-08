@@ -2,7 +2,7 @@ name: CI/CD Pipeline for Order Service
 
 on:
   push:
-    branches: [ "main", "dev_yji" ]
+    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
 
@@ -70,4 +70,9 @@ jobs:
           git config --global user.name "github-actions"
           git add kustomization.yaml
           git diff --cached --quiet || git commit -m "chore(order): update image tag to ${{ github.sha }} [skip ci]"
-          git push origin main
+          n=0
+          until [ "$n" -ge 5 ]; do
+            git pull --rebase origin main && git push origin main && break
+            n=$((n+1))
+            sleep $((n * 3))
+          done
