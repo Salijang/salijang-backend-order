@@ -53,7 +53,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://sallijang.shop"],
+    allow_origins=["https://sallijang.shop", "https://app.sallijang.shop"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
