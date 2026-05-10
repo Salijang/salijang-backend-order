@@ -10,6 +10,7 @@ from sqlalchemy.types import Date as SQLDate
 from typing import List, Optional
 import datetime
 import os
+import time
 import httpx
 
 from database import get_db
@@ -22,6 +23,31 @@ import schemas
 router = APIRouter(prefix="/api/v1/orders", tags=["Orders"])
 
 PRODUCT_SERVICE_URL = os.getenv("PRODUCT_SERVICE_URL", "http://localhost:8001")
+ORDER_SLOW_LOG_MS = int(os.getenv("ORDER_SLOW_LOG_MS", "1000"))
+
+
+class StepTimer:
+    def __init__(self, name: str):
+        self.name = name
+        self.start = time.perf_counter()
+        self.last = self.start
+        self.steps: list[tuple[str, float]] = []
+
+    def mark(self, step: str) -> None:
+        now = time.perf_counter()
+        self.steps.append((step, (now - self.last) * 1000))
+        self.last = now
+
+    def total_ms(self) -> float:
+        return (time.perf_counter() - self.start) * 1000
+
+    def log_if_slow(self, **fields) -> None:
+        total = self.total_ms()
+        if total < ORDER_SLOW_LOG_MS:
+            return
+        field_text = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+        step_text = " ".join(f"{step}={elapsed:.1f}ms" for step, elapsed in self.steps)
+        print(f"[PERF] {self.name} total={total:.1f}ms {field_text} {step_text}")
 
 
 async def get_product_remaining(product_id: int) -> int | None:
@@ -91,76 +117,93 @@ async def create_order(
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    timer = StepTimer("create_order")
+    created_order = None
     redis_reserved: list[tuple[int, int]] = []
-    for item_data in order_data.items:
-        if not item_data.product_id:
-            continue
-        result = await reserve_stock(item_data.product_id, item_data.quantity)
-        if result is False:
-            for pid, qty in redis_reserved:
-                await restore_stock(pid, qty)
-            raise HTTPException(status_code=409, detail="재고가 부족합니다.")
-        if result is True:
-            redis_reserved.append((item_data.product_id, item_data.quantity))
-        if result is None:
-            remaining = await get_product_remaining(item_data.product_id)
-            if remaining is None:
-                raise HTTPException(status_code=503, detail="재고 정보를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.")
-            if remaining < item_data.quantity:
-                raise HTTPException(status_code=409, detail=f"재고가 부족합니다. 현재 남은 수량: {remaining}개")
+    try:
+        for item_data in order_data.items:
+            if not item_data.product_id:
+                continue
+            result = await reserve_stock(item_data.product_id, item_data.quantity)
+            if result is False:
+                for pid, qty in redis_reserved:
+                    await restore_stock(pid, qty)
+                raise HTTPException(status_code=409, detail="재고가 부족합니다.")
+            if result is True:
+                redis_reserved.append((item_data.product_id, item_data.quantity))
+            if result is None:
+                remaining = await get_product_remaining(item_data.product_id)
+                if remaining is None:
+                    raise HTTPException(status_code=503, detail="재고 정보를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.")
+                if remaining < item_data.quantity:
+                    raise HTTPException(status_code=409, detail=f"재고가 부족합니다. 현재 남은 수량: {remaining}개")
+        timer.mark("stock_reserve")
 
-    new_order = models.Order(
-        order_number="TEMP",
-        buyer_id=current_user.user_id,
-        store_id=order_data.store_id,
-        store_name=order_data.store_name,
-        status="pending",
-        payment_method=order_data.payment_method,
-        total_price=order_data.total_price,
-        pickup_expected_at=order_data.pickup_expected_at,
-    )
-    db.add(new_order)
-    await db.flush()
-
-    new_order.order_number = generate_order_number(new_order.id, new_order.created_at)
-
-    for item_data in order_data.items:
-        item = models.OrderItem(
-            order_id=new_order.id,
-            product_id=item_data.product_id,
-            product_name=item_data.product_name,
-            quantity=item_data.quantity,
-            unit_price=item_data.unit_price,
+        new_order = models.Order(
+            order_number="TEMP",
+            buyer_id=current_user.user_id,
+            store_id=order_data.store_id,
+            store_name=order_data.store_name,
+            status="pending",
+            payment_method=order_data.payment_method,
+            total_price=order_data.total_price,
+            pickup_expected_at=order_data.pickup_expected_at,
         )
-        db.add(item)
+        db.add(new_order)
+        await db.flush()
+        timer.mark("order_flush")
 
-    await db.commit()
+        new_order.order_number = generate_order_number(new_order.id, new_order.created_at)
 
-    result = await db.execute(
-        select(models.Order)
-        .options(selectinload(models.Order.items))
-        .filter(models.Order.id == new_order.id)
-    )
-    created_order = result.scalars().first()
+        for item_data in order_data.items:
+            item = models.OrderItem(
+                order_id=new_order.id,
+                product_id=item_data.product_id,
+                product_name=item_data.product_name,
+                quantity=item_data.quantity,
+                unit_price=item_data.unit_price,
+            )
+            db.add(item)
 
-    await publish_stock_deduct_event({
-        "event_type": "stock_deduct",
-        "order_id": created_order.id,
-        "items": [
-            {"product_id": item.product_id, "quantity": item.quantity}
-            for item in created_order.items
-            if item.product_id
-        ],
-    })
-    await send_notify_event("order_confirmed", created_order)
+        await db.commit()
+        timer.mark("db_commit")
 
-    order_payload = schemas.OrderResponse.model_validate(created_order).model_dump(mode="json")
-    await _publish_store_event(
-        created_order.store_id,
-        {"event_type": "new_order", "order": order_payload},
-    )
+        result = await db.execute(
+            select(models.Order)
+            .options(selectinload(models.Order.items))
+            .filter(models.Order.id == new_order.id)
+        )
+        created_order = result.scalars().first()
+        timer.mark("order_reload")
 
-    return created_order
+        await publish_stock_deduct_event({
+            "event_type": "stock_deduct",
+            "order_id": created_order.id,
+            "items": [
+                {"product_id": item.product_id, "quantity": item.quantity}
+                for item in created_order.items
+                if item.product_id
+            ],
+        })
+        timer.mark("stock_deduct_publish")
+        await send_notify_event("order_confirmed", created_order)
+        timer.mark("notify_publish")
+
+        order_payload = schemas.OrderResponse.model_validate(created_order).model_dump(mode="json")
+        await _publish_store_event(
+            created_order.store_id,
+            {"event_type": "new_order", "order": order_payload},
+        )
+        timer.mark("store_publish")
+
+        return created_order
+    finally:
+        timer.log_if_slow(
+            order_id=getattr(created_order, "id", None),
+            store_id=order_data.store_id,
+            item_count=len(order_data.items),
+            reserved=len(redis_reserved),
+        )
 
 
 @router.get("/", response_model=List[schemas.OrderResponse])

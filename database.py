@@ -10,6 +10,9 @@ DB_USER = os.environ.get("DB_USER", "adminuser")
 DB_NAME = os.environ.get("DB_NAME", "pickupdb")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-2")
+DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "3"))
+DB_MAX_OVERFLOW = int(os.environ.get("DB_MAX_OVERFLOW", "2"))
+DB_POOL_TIMEOUT = int(os.environ.get("DB_POOL_TIMEOUT", "3"))
 
 _USE_IAM = not bool(DB_PASSWORD)
 
@@ -31,7 +34,11 @@ else:
 
 engine = create_async_engine(
     _url,
+    pool_size=DB_POOL_SIZE,
+    max_overflow=DB_MAX_OVERFLOW,
+    pool_timeout=DB_POOL_TIMEOUT,
     pool_recycle=600,
+    pool_pre_ping=True,
     connect_args=_connect_args,
     echo=False,
 )
