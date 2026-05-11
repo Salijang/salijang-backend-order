@@ -65,7 +65,7 @@ async def get_product_remaining(product_id: int) -> int | None:
         return None
 
 
-async def send_notify_event(event_type: str, order: models.Order) -> None:
+async def send_notify_event(event_type: str, order) -> None:
     payload = {
         "event_type": event_type,
         "order_id": order.id,
@@ -120,6 +120,7 @@ async def create_order(
 ):
     timer = StepTimer("create_order")
     created_order = None
+    created_items: list[models.OrderItem] = []
     redis_reserved: list[tuple[int, int]] = []
     try:
         for item_data in order_data.items:
@@ -167,17 +168,34 @@ async def create_order(
                 unit_price=item_data.unit_price,
             )
             db.add(item)
+            created_items.append(item)
 
         await db.commit()
         timer.mark("db_commit")
 
-        result = await db.execute(
-            select(models.Order)
-            .options(selectinload(models.Order.items))
-            .filter(models.Order.id == new_order.id)
+        created_order = schemas.OrderResponse(
+            id=new_order.id,
+            order_number=new_order.order_number,
+            buyer_id=new_order.buyer_id,
+            store_id=new_order.store_id,
+            store_name=new_order.store_name,
+            status=new_order.status,
+            payment_method=new_order.payment_method,
+            total_price=new_order.total_price,
+            pickup_expected_at=new_order.pickup_expected_at,
+            created_at=new_order.created_at,
+            items=[
+                schemas.OrderItemResponse(
+                    id=item.id,
+                    product_id=item.product_id,
+                    product_name=item.product_name,
+                    quantity=item.quantity,
+                    unit_price=item.unit_price,
+                )
+                for item in created_items
+            ],
         )
-        created_order = result.scalars().first()
-        timer.mark("order_reload")
+        timer.mark("response_build")
 
         await publish_stock_deduct_event({
             "event_type": "stock_deduct",
@@ -192,7 +210,7 @@ async def create_order(
         await send_notify_event("order_confirmed", created_order)
         timer.mark("notify_publish")
 
-        order_payload = schemas.OrderResponse.model_validate(created_order).model_dump(mode="json")
+        order_payload = created_order.model_dump(mode="json")
         await _publish_store_event(
             created_order.store_id,
             {"event_type": "new_order", "order": order_payload},
