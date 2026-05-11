@@ -11,6 +11,7 @@ from typing import List, Optional
 import datetime
 import os
 import time
+import uuid
 import httpx
 
 from database import get_db
@@ -140,7 +141,9 @@ async def create_order(
         timer.mark("stock_reserve")
 
         new_order = models.Order(
-            order_number="TEMP",
+            # order_number is unique. A shared placeholder such as "TEMP" makes
+            # concurrent inserts wait on the same unique index entry during flush.
+            order_number=f"PENDING-{uuid.uuid4().hex}",
             buyer_id=current_user.user_id,
             store_id=order_data.store_id,
             store_name=order_data.store_name,
