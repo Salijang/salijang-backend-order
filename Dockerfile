@@ -3,7 +3,8 @@ FROM python:3.11-slim
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+ENV DISABLE_SQLALCHEMY_CEXT=1
+RUN pip install --no-cache-dir --no-binary=SQLAlchemy -r requirements.txt
 
 COPY . .
 
